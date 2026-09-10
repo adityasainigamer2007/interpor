@@ -50,54 +50,96 @@ const { user } = await requireRole("admin");     // role-gated page
 sees their mentees'; an admin sees everything. The rule lives in one place
 (`visibleUserIds` in `src/lib/queries.ts`) and every read goes through it.
 
-## Getting started
+## First run
 
 ```bash
 npm install
-cp .env.example .env.local          # then set AUTH_SECRET
-npm run dev                         # http://localhost:3000
+cp .env.example .env.local
 ```
 
-Generate a secret:
+Fill in `.env.local`. At minimum you need `AUTH_SECRET`, `APP_URL` and `SETUP_TOKEN`:
 
 ```bash
-node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"   # AUTH_SECRET
+node -e "console.log(require('crypto').randomBytes(16).toString('hex'))"   # SETUP_TOKEN
 ```
 
-The datastore seeds itself on first request with a full demo cohort — 9 people,
-4 projects, 12 tasks, 45 time entries, submissions with real feedback.
+Then:
 
-**Demo accounts** (password for all: `AyavaStudio2026`)
+```bash
+npm run build && npm start
+```
 
-| Role | Email |
-| --- | --- |
-| Admin | `studio@ayavacreatives.com` |
-| Mentor | `priya@ayavacreatives.com`, `daniel@…`, `sofia@…` |
-| Intern | `arjun@ayavacreatives.com`, `maya@…`, `leo@…`, `hana@…`, `noah@…` |
+The portal starts **completely empty — there is no seed or demo data.** Visit `/setup`
+(any other URL redirects you there) and create the first administrator using your
+`SETUP_TOKEN`. That page seals itself permanently the moment an account exists, so it
+cannot be used to hijack the studio later.
 
-`npm run seed` clears the datastore so it rebuilds from seed on the next request.
+From there, everything is real: invite your mentors and interns from **Admin →
+Invitations**, create projects on the **Projects** page, and assign tasks from **Tasks**.
 
-## No email is sent
+## Email
 
-Verification codes, password resets and invitation links are written to
-`data/outbox.json` and printed to the server console. The admin console surfaces them
-at **Admin → Invitations → Dev outbox**, so every flow is walkable without an SMTP
-account. To go live, replace `deliver()` in `src/lib/mail.ts` with your provider —
-nothing else calls out.
+Verification codes, password resets and invitations go out over SMTP. Set `SMTP_HOST`,
+`SMTP_PORT`, `SMTP_USER`, `SMTP_PASS` and `MAIL_FROM`, then confirm the connection at
+**Admin → Invitations → Email delivery**, which runs a live check against your server.
+
+In production, a missing or broken SMTP configuration is a hard error rather than a
+silent no-op — a verification code that vanishes is indistinguishable, to the person
+waiting for it, from a broken product. In development with no SMTP set, messages are
+printed to the console and appended to `data/outbox.log` so flows stay walkable.
+
+Common settings:
+
+| Provider | Host | Port |
+| --- | --- | --- |
+| Zoho (India) | `smtp.zoho.in` | 465 |
+| Zoho (global) | `smtp.zoho.com` | 465 |
+| Google Workspace | `smtp.gmail.com` | 465 (needs an App Password) |
+| Microsoft 365 | `smtp.office365.com` | 587 |
+
+## Deploying
+
+Built for a single long-lived Node process — a VPS, Railway, Render, or any host that
+runs `npm start` continuously.
+
+```bash
+npm ci
+npm run build
+npm start          # put this behind a process manager, e.g. pm2 or a systemd unit
+```
+
+Put Nginx or Caddy in front for TLS, and set `APP_URL` to the real https address —
+invitation and reset links are built from it. It is read at runtime (not baked into
+the build), and in production the portal refuses to start a send without it rather
+than emailing broken localhost links.
+
+**Back up `data/portal.db`.** It holds every account, timesheet and piece of feedback.
+SQLite in WAL mode also writes `portal.db-wal` and `portal.db-shm`; the simplest correct
+backup is:
+
+```bash
+sqlite3 data/portal.db ".backup '/backups/portal-$(date +%F).db'"
+```
+
+This is **not** suitable for serverless hosts (Vercel, Netlify): their filesystem is
+wiped between invocations, so the database would disappear. If you move there, replace
+`read()`/`mutate()` in `src/lib/db/store.ts` with a Postgres-backed implementation — they
+are the entire persistence interface — and move the rate limiter
+(`src/lib/auth/rate-limit.ts`, currently process-local) to Redis.
 
 ## Testing
 
 ```bash
 npm run typecheck
 npm run build
-npm start &
-npm run test:e2e      # 33 checks through a real browser
+npm run test:e2e      # drives a real browser against a throwaway database
 ```
 
-The end-to-end test drives sign-in, all 14 signed-in routes, task/project detail,
-sending and accepting an invitation, self sign-up with a wrong-then-right verification
-code, the pending lobby, role enforcement and mobile layout. It writes to the datastore
-— point it at a disposable one.
+The end-to-end test provisions its own empty SQLite file, runs first-run setup, then
+walks the real flows: inviting a mentor and an intern, accepting an invitation, public
+sign-up with a wrong-then-right verification code, the pending lobby, every signed-in
+route, role enforcement and mobile layout. It never touches your live database.
 
 `PW_CHROMIUM=/path/to/chrome` uses a system Chromium instead of a downloaded one.
 
@@ -119,7 +161,7 @@ src/
     actions/           tasks · time · submissions · profile · admin
     queries.ts         every read, with visibility rules applied
     format.ts          dates, hours, durations
-  middleware.ts        fast-path redirect for signed-out visitors
+  proxy.ts             fast-path redirect for signed-out visitors
 ```
 
 ### Security
@@ -128,7 +170,7 @@ src/
 - **Sessions** — server-side records referenced by an HTTP-only, SameSite=Lax, `Secure`-in-production cookie carrying an HMAC signature, so a guessed or forged session id is rejected before any lookup. 30-day expiry, revocable per device.
 - **Tokens and codes** — invitation tokens and email codes are stored only as HMAC digests; the plaintext exists solely in the email.
 - **Rate limiting** — per-account throttling on sign-in, sign-up, verification, resend and reset.
-- **Authority** — `middleware.ts` only checks for a cookie's presence (it runs on the edge runtime, where scrypt isn't available). Every protected page independently validates the signature, the session record and the user's status via `requireAuth()`/`requireRole()`.
+- **Authority** — `proxy.ts` (Next 16's rename of Middleware) only checks for a cookie's presence, because it runs on the edge runtime where scrypt isn't available. Every protected page independently validates the signature, the session record and the user's status via `requireAuth()`/`requireRole()`.
 - **Audit** — every security-relevant action is recorded with actor, target, IP and metadata.
 - **Escalation guards** — the last active admin cannot be demoted or suspended; suspending a user revokes their sessions immediately; changing a password signs out every other device.
 
@@ -137,16 +179,13 @@ development it falls back to a fixed dev secret.
 
 ### Data layer
 
-Everything persists to one JSON document (`data/db.json`), read into memory once and
-written atomically (temp file + rename). It is deliberately the only module that knows
-how persistence works: `read()` and `mutate()` in `src/lib/db/store.ts` are the entire
-interface, so moving to Postgres/Prisma means reimplementing those two functions and
-nothing else.
+SQLite (`data/portal.db`, WAL mode) is the durable source of truth. The working set is
+held in memory so reads never touch the disk, and every mutation is flushed inside a
+single transaction — a crash or power cut cannot leave a half-written state. Layout is
+one table per collection, one row per entity.
 
-This suits a cohort-sized portal (tens of users) on a single long-lived Node process.
-Before scaling past that — or deploying to serverless, where the filesystem isn't
-durable — swap the store for a real database and move the rate limiter
-(`src/lib/auth/rate-limit.ts`, currently process-local) to Redis.
+`read()` and `mutate()` in `src/lib/db/store.ts` are the entire persistence interface, so
+swapping in Postgres later means reimplementing two functions and nothing else.
 
 ### Design
 

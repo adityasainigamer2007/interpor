@@ -1,19 +1,22 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 
+import { NewProjectForm } from "@/components/projects/NewProjectForm";
 import { Avatar } from "@/components/ui/Avatar";
 import { ProjectStatusBadge } from "@/components/ui/Badges";
 import { EmptyState, PageHeader, Progress } from "@/components/ui/Page";
 import { can, requireAuth } from "@/lib/auth/guards";
 import { daysUntil, formatDate } from "@/lib/format";
-import { allProjects, projectsVisibleTo, tasksVisibleTo, userMap } from "@/lib/queries";
+import { allProjects, allUsers, projectsVisibleTo, tasksVisibleTo, userMap } from "@/lib/queries";
 
 export const metadata: Metadata = { title: "Projects" };
 
 export default async function ProjectsPage() {
   const { user } = await requireAuth();
 
+  const isMentor = can(user, "mentor");
   const projects = can(user, "admin") ? allProjects() : projectsVisibleTo(user);
+  const teammates = isMentor ? allUsers().filter((u) => u.status === "active" && u.id !== user.id) : [];
   const tasks = tasksVisibleTo(user);
   const people = userMap();
 
@@ -24,6 +27,8 @@ export default async function ProjectsPage() {
         title="Projects"
         description="The jobs you're attached to, who's leading them and how far along they are."
       />
+
+      {isMentor ? <NewProjectForm people={teammates} /> : null}
 
       {projects.length ? (
         <div className="grid grid-auto">

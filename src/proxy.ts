@@ -1,11 +1,10 @@
 import { NextResponse, type NextRequest } from "next/server";
 
 /**
- * Fast-path route guard.
+ * Fast-path route guard (Next 16 renamed this convention from Middleware to Proxy).
  *
- * Middleware only checks that a session cookie is *present* — it runs on the
- * edge runtime where the scrypt/HMAC verification in `lib/auth` isn't
- * available. Actual authority sits in `requireAuth()` / `requireRole()` inside
+ * Proxy only checks that a session cookie is *present* — it runs on the edge
+ * runtime where the scrypt/HMAC verification in `lib/auth` isn't available. Actual authority sits in `requireAuth()` / `requireRole()` inside
  * the server components, which validate the signature, the session record and
  * the user's status on every request. This layer exists to bounce signed-out
  * visitors before a protected page starts rendering.
@@ -19,6 +18,7 @@ const PUBLIC_ROUTES = [
   "/forgot-password",
   "/reset-password",
   "/pending",
+  "/setup",
 ];
 
 function isPublic(pathname: string): boolean {
@@ -27,7 +27,7 @@ function isPublic(pathname: string): boolean {
   return false;
 }
 
-export function middleware(request: NextRequest) {
+export function proxy(request: NextRequest) {
   const { pathname, search } = request.nextUrl;
   const hasSession = request.cookies.has("ayava_session");
 

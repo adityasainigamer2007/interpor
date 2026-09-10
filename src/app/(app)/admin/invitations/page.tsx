@@ -6,8 +6,8 @@ import { RoleBadge } from "@/components/ui/Badges";
 import { EmptyState, PageHeader } from "@/components/ui/Page";
 import { Icon } from "@/components/ui/Icons";
 import { requireRole } from "@/lib/auth/guards";
-import { formatDate, formatDateTime, relativeTime } from "@/lib/format";
-import { readOutbox } from "@/lib/mail";
+import { formatDate, relativeTime } from "@/lib/format";
+import { isSmtpConfigured, mailFrom, readOutbox, verifyMailTransport } from "@/lib/mail";
 import { invitations, mentors, userMap } from "@/lib/queries";
 
 export const metadata: Metadata = { title: "Invitations" };
@@ -24,7 +24,9 @@ export default async function AdminInvitationsPage() {
 
   const list = invitations();
   const people = userMap();
-  const outbox = readOutbox(8);
+  const smtpOn = isSmtpConfigured();
+  const mail = await verifyMailTransport();
+  const outbox = smtpOn ? "" : readOutbox();
 
   return (
     <div className="stack g-5">
@@ -96,43 +98,55 @@ export default async function AdminInvitationsPage() {
             )}
           </section>
 
-          {/* The dev mailbox — this is where invitation links actually land. */}
+          {/* Delivery health — an invitation that cannot be sent is worse than none. */}
           <section className="panel rise">
             <div className="panel-head">
               <div className="stack g-1">
-                <h3>Dev outbox</h3>
+                <h3>Email delivery</h3>
                 <span className="t-xs faint">
-                  No mail is sent in development. Invitation and code emails land here and in the server console.
+                  {smtpOn ? `Sending as ${mailFrom()}` : "SMTP is not configured"}
                 </span>
               </div>
               <Icon.mail size={18} />
             </div>
 
-            {outbox.length ? (
-              <div className="panel-body stack g-4">
-                {outbox.map((message, i) => (
-                  <div key={`${message.sentAt}-${i}`} className="stack g-2">
-                    <div className="row between g-3 wrap">
-                      <span className="t-sm medium truncate">{message.subject}</span>
-                      <span className="t-xs faint nowrap">{formatDateTime(message.sentAt)}</span>
-                    </div>
-                    <span className="t-xs faint">to {message.to}</span>
-                    {message.actionUrl ? (
-                      <a
-                        href={message.actionUrl}
-                        className="link t-xs mono truncate"
-                        style={{ display: "block" }}
-                      >
-                        {message.actionUrl}
-                      </a>
-                    ) : null}
-                    {i < outbox.length - 1 ? <hr className="rule" /> : null}
-                  </div>
-                ))}
+            <div className="panel-body stack g-4">
+              <div className={mail.ok ? "alert alert-ok" : "alert alert-error"}>
+                <span>
+                  <strong>{mail.ok ? "Connected." : "Not sending."}</strong> {mail.detail}
+                </span>
               </div>
-            ) : (
-              <EmptyState title="Outbox is empty" description="Send an invitation and it'll appear here." />
-            )}
+
+              {!smtpOn ? (
+                <>
+                  <p className="t-sm muted" style={{ lineHeight: 1.65 }}>
+                    Until SMTP is set, verification codes and invitation links are written to the
+                    server console and <code className="mono">data/outbox.log</code> instead of being
+                    emailed. In production the portal refuses to send rather than failing silently.
+                  </p>
+                  {outbox ? (
+                    <pre
+                      className="mono t-xs"
+                      style={{
+                        margin: 0,
+                        padding: 14,
+                        maxHeight: 260,
+                        overflow: "auto",
+                        background: "var(--ink-900)",
+                        border: "1px solid var(--line)",
+                        borderRadius: "var(--r-md)",
+                        color: "var(--text-dim)",
+                        whiteSpace: "pre-wrap",
+                      }}
+                    >
+                      {outbox}
+                    </pre>
+                  ) : (
+                    <p className="hint">Nothing sent yet.</p>
+                  )}
+                </>
+              ) : null}
+            </div>
           </section>
         </div>
 

@@ -4,87 +4,135 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 
-import { type Database, EMPTY_DB } from "./schema";
+import Database from "better-sqlite3";
+
+import { type Database as Db, EMPTY_DB } from "./schema";
 
 /**
- * Single-document JSON datastore.
+ * SQLite-backed datastore.
  *
- * Everything the portal persists lives in one JSON file, read into memory once
- * and written back atomically (tmp file + rename) on every mutation. That keeps
- * the whole app dependency-free and trivially portable — it is deliberately the
- * only module that knows how persistence works, so swapping in Postgres/Prisma
- * later means reimplementing `read` and `mutate` and nothing else.
+ * The portal keeps its working set in memory for reads — every query in
+ * `queries.ts` filters plain arrays — and treats SQLite as the durable source
+ * of truth. Each mutation is flushed inside a single transaction, so a crash
+ * or a power cut can never leave a half-written state, and WAL mode keeps
+ * concurrent readers from blocking the writer.
  *
- * Suitable for a cohort-sized portal (tens of users) on a single long-lived
- * Node process. See README for the notes on moving to a real database.
+ * Layout is one table per collection, one row per entity (`id`, `data` JSON).
+ * That keeps the document model the application code already uses while giving
+ * real transactional durability. Reads never touch the disk after boot.
  */
 
-const DATA_FILE = process.env.DATA_FILE
-  ? path.resolve(process.env.DATA_FILE)
-  : path.join(process.cwd(), "data", "db.json");
+const DB_FILE = process.env.DATABASE_FILE
+  ? path.resolve(process.env.DATABASE_FILE)
+  : path.join(process.cwd(), "data", "portal.db");
 
-type Cache = { db: Database | null };
+const COLLECTIONS = [
+  "users",
+  "sessions",
+  "codes",
+  "invitations",
+  "projects",
+  "tasks",
+  "timeEntries",
+  "submissions",
+  "announcements",
+  "resources",
+  "audit",
+] as const;
 
-// Survive dev-server hot reloads, which would otherwise re-read (and race) the file.
-const globalCache = globalThis as unknown as { __ayavaDb?: Cache };
-const cache: Cache = (globalCache.__ayavaDb ??= { db: null });
+type Collection = (typeof COLLECTIONS)[number];
 
-function load(): Database {
-  if (cache.db) return cache.db;
+interface Handle {
+  sql: Database.Database;
+  db: Db;
+  /** Digest of each collection at last flush, so unchanged tables are skipped. */
+  marks: Map<Collection, string>;
+}
 
-  if (!fs.existsSync(DATA_FILE)) {
-    // First boot: lay down a seeded database so the portal is never a blank slate.
-    const seeded = buildSeed();
-    persist(seeded);
-    cache.db = seeded;
-    return seeded;
+// Survive dev-server hot reloads, which would otherwise reopen the file per edit.
+const globalHandle = globalThis as unknown as { __ayavaStore?: Handle };
+
+function open(): Handle {
+  if (globalHandle.__ayavaStore) return globalHandle.__ayavaStore;
+
+  fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
+  const sql = new Database(DB_FILE);
+
+  // WAL survives crashes and lets reads proceed during a write.
+  sql.pragma("journal_mode = WAL");
+  sql.pragma("synchronous = NORMAL");
+  sql.pragma("foreign_keys = ON");
+
+  for (const name of COLLECTIONS) {
+    sql.exec(`CREATE TABLE IF NOT EXISTS "${name}" (id TEXT PRIMARY KEY, data TEXT NOT NULL)`);
   }
 
-  try {
-    const raw = fs.readFileSync(DATA_FILE, "utf8");
-    const parsed = JSON.parse(raw) as Partial<Database>;
-    // Merge over EMPTY_DB so a file written by an older version still loads.
-    cache.db = { ...structuredClone(EMPTY_DB), ...parsed };
-    return cache.db;
-  } catch (err) {
-    throw new Error(
-      `Could not read the datastore at ${DATA_FILE}: ${(err as Error).message}. ` +
-        `Delete the file to regenerate it from seed.`,
-    );
+  const db = structuredClone(EMPTY_DB);
+  const marks = new Map<Collection, string>();
+
+  for (const name of COLLECTIONS) {
+    const rows = sql.prepare(`SELECT data FROM "${name}"`).all() as { data: string }[];
+    const parsed = rows.map((r) => JSON.parse(r.data));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (db as any)[name] = parsed;
+    marks.set(name, digest(parsed));
   }
+
+  const handle: Handle = { sql, db, marks };
+  globalHandle.__ayavaStore = handle;
+  return handle;
 }
 
-function persist(db: Database): void {
-  const dir = path.dirname(DATA_FILE);
-  fs.mkdirSync(dir, { recursive: true });
-  const tmp = path.join(dir, `.db.${crypto.randomBytes(6).toString("hex")}.tmp`);
-  fs.writeFileSync(tmp, JSON.stringify(db, null, 2), "utf8");
-  fs.renameSync(tmp, DATA_FILE);
+function digest(value: unknown): string {
+  return crypto.createHash("sha1").update(JSON.stringify(value)).digest("base64");
 }
 
-/** Read-only view of the database. Never mutate the result — use `mutate`. */
-export function read(): Database {
-  return load();
+function flush(handle: Handle): void {
+  const { sql, db, marks } = handle;
+
+  const changed: Collection[] = [];
+  for (const name of COLLECTIONS) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const current = digest((db as any)[name]);
+    if (current !== marks.get(name)) changed.push(name);
+  }
+  if (!changed.length) return;
+
+  const write = sql.transaction(() => {
+    for (const name of changed) {
+      sql.prepare(`DELETE FROM "${name}"`).run();
+      const insert = sql.prepare(`INSERT INTO "${name}" (id, data) VALUES (?, ?)`);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      for (const row of (db as any)[name] as { id: string }[]) {
+        insert.run(row.id, JSON.stringify(row));
+      }
+    }
+  });
+
+  write();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  for (const name of changed) marks.set(name, digest((db as any)[name]));
 }
 
-/** Apply a mutation and flush it to disk. Returns whatever the mutator returns. */
-export function mutate<T>(fn: (db: Database) => T): T {
-  const db = load();
-  const result = fn(db);
-  persist(db);
+/** Read-only view. Never mutate the result — use `mutate`. */
+export function read(): Db {
+  return open().db;
+}
+
+/** Apply a mutation and commit it in one transaction. */
+export function mutate<T>(fn: (db: Db) => T): T {
+  const handle = open();
+  const result = fn(handle.db);
+  flush(handle);
   return result;
 }
 
-/** Wipe and re-seed. Used by `npm run seed`. */
-export function reseed(): Database {
-  const seeded = buildSeed();
-  persist(seeded);
-  cache.db = seeded;
-  return seeded;
+/** True when nobody has an account yet — gates the first-run setup page. */
+export function isUninitialised(): boolean {
+  return read().users.length === 0;
 }
 
 export function id(prefix: string): string {
-  // Clerk-ish, readable, sortable-enough identifiers: usr_2fK9xQ...
   return `${prefix}_${crypto.randomBytes(12).toString("base64url")}`;
 }
 
@@ -92,11 +140,21 @@ export function now(): string {
   return new Date().toISOString();
 }
 
-export const dataFilePath = DATA_FILE;
+export const databaseFile = DB_FILE;
 
-// Imported lazily to avoid a cycle: seed.ts needs `id`/`now` from this module.
-function buildSeed(): Database {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { seedDatabase } = require("./seed") as typeof import("./seed");
-  return seedDatabase();
+/** Row counts, for the admin console's storage panel. */
+export function storageStats(): { file: string; sizeBytes: number; counts: Record<string, number> } {
+  const handle = open();
+  const counts: Record<string, number> = {};
+  for (const name of COLLECTIONS) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    counts[name] = ((handle.db as any)[name] as unknown[]).length;
+  }
+  let sizeBytes = 0;
+  try {
+    sizeBytes = fs.statSync(DB_FILE).size;
+  } catch {
+    sizeBytes = 0;
+  }
+  return { file: DB_FILE, sizeBytes, counts };
 }

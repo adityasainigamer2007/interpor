@@ -36,6 +36,22 @@ import {
  * `useActionState`, except where the flow ends in a redirect.
  */
 
+
+/**
+ * Delivery failures must never be silent: if the code or invitation cannot be
+ * sent, the person is left staring at a form waiting for an email that will
+ * never arrive. Returns an error message, or null on success.
+ */
+async function trySend(send: () => Promise<void>, what: string): Promise<string | null> {
+  try {
+    await send();
+    return null;
+  } catch (error) {
+    console.error(`[mail] failed to send ${what}:`, error);
+    return `We couldn't send your ${what}. Check the email address, or contact the studio if this keeps happening.`;
+  }
+}
+
 const CODE_TTL_MS = 15 * 60 * 1000;
 const CODE_MAX_ATTEMPTS = 6;
 const INVITE_TTL_MS = 14 * 86_400_000;
@@ -137,7 +153,11 @@ export async function signInAction(_prev: FormState, data: FormData): Promise<Fo
 
   if (!user.emailVerified) {
     const code = issueCode(user.id, "email_verification");
-    sendVerificationCode(user.email, user.firstName, code);
+    const failed = await trySend(
+      () => sendVerificationCode(user.email, user.firstName, code),
+      "verification code",
+    );
+    if (failed) return formError(failed, undefined, values);
     redirect(`/verify?email=${encodeURIComponent(user.email)}`);
   }
 
@@ -203,7 +223,18 @@ export async function signUpAction(_prev: FormState, data: FormData): Promise<Fo
 
   mutate((db) => db.users.push(user));
   const code = issueCode(user.id, "email_verification");
-  sendVerificationCode(user.email, user.firstName, code);
+  const failed = await trySend(
+    () => sendVerificationCode(user.email, user.firstName, code),
+    "verification code",
+  );
+  if (failed) {
+    // Roll the account back so the address stays free to try again.
+    mutate((db) => {
+      db.users = db.users.filter((u) => u.id !== user.id);
+      db.codes = db.codes.filter((c) => c.userId !== user.id);
+    });
+    return formError(failed, undefined, values);
+  }
   await recordAudit("auth.sign_up", user.email, { discipline }, { id: user.id, email: user.email });
 
   redirect(`/verify?email=${encodeURIComponent(email)}`);
@@ -251,8 +282,14 @@ export async function resendCodeAction(_prev: FormState, data: FormData): Promis
   const user = findUserByEmail(email);
   if (user) {
     const code = issueCode(user.id, purpose);
-    if (purpose === "password_reset") sendPasswordReset(user.email, user.firstName, code);
-    else sendVerificationCode(user.email, user.firstName, code);
+    const failed = await trySend(
+      () =>
+        purpose === "password_reset"
+          ? sendPasswordReset(user.email, user.firstName, code)
+          : sendVerificationCode(user.email, user.firstName, code),
+      "code",
+    );
+    if (failed) return formError(failed);
   }
   // Same answer either way — this endpoint must not confirm who has an account.
   return formSuccess("If that address is registered, a new code is on its way.");
@@ -270,7 +307,11 @@ export async function forgotPasswordAction(_prev: FormState, data: FormData): Pr
   const user = findUserByEmail(email);
   if (user) {
     const code = issueCode(user.id, "password_reset");
-    sendPasswordReset(user.email, user.firstName, code);
+    const failed = await trySend(
+      () => sendPasswordReset(user.email, user.firstName, code),
+      "reset code",
+    );
+    if (failed) return formError(failed, undefined, { email });
     await recordAudit("auth.reset_requested", user.email, {}, { id: user.id, email: user.email });
   }
 
@@ -338,9 +379,10 @@ export async function createInvitationAction(_prev: FormState, data: FormData): 
   if (live) return formError("There's already a live invitation for that address. Revoke it first to send another.");
 
   const token = randomToken(32);
+  const invitationId = id("inv");
   mutate((d) =>
     d.invitations.push({
-      id: id("inv"),
+      id: invitationId,
       email,
       role,
       tokenHash: hmac(`invite:${token}`),
@@ -357,10 +399,21 @@ export async function createInvitationAction(_prev: FormState, data: FormData): 
     }),
   );
 
-  sendInvitation(email, firstName, session.user.fullName, token);
+  const failed = await trySend(
+    () => sendInvitation(email, firstName, session.user.fullName, token),
+    "invitation",
+  );
+  if (failed) {
+    // Withdraw the invitation so the address can be invited again cleanly.
+    mutate((d) => {
+      d.invitations = d.invitations.filter((i) => i.id !== invitationId);
+    });
+    return formError(failed);
+  }
+
   await recordAudit("invitation.created", email, { role });
   revalidatePath("/admin/invitations");
-  return formSuccess(`Invitation sent to ${email}. The link is in the dev outbox below.`);
+  return formSuccess(`Invitation sent to ${email}.`);
 }
 
 export async function revokeInvitationAction(invitationId: string): Promise<void> {
